@@ -1,0 +1,312 @@
+﻿#pragma kernel CSMain
+#include "Assets/Scripts/3rdPary/noiseSimplex.cginc"
+
+struct Block
+{
+    int blockType;
+    int biomType;
+    int3 position;
+    int visible;
+};
+
+struct Octaves
+{
+    float3 Octave1; // x - freq, y - amp, z - pow
+    float3 Octave2;
+    float3 Octave3;
+};
+
+struct Planet
+{
+    float2 sizeRange;
+    float2 heightRange;
+    int blockType;
+    float rarity;
+
+    int mountain0;
+    int mountain1;
+
+    float noiseAmplitude;
+    Octaves octaves;
+};
+
+struct BiomConfig
+{
+    float threshold;
+    float3 seed;
+    Octaves octaves;
+
+    int maxPlanetSize;
+    int planet0;
+    int planet1;
+    int planet2;
+};
+
+struct Mountain
+{
+    float height;
+    Octaves octaves;
+    int blockType;
+};
+
+RWStructuredBuffer<Block> blocks;
+StructuredBuffer<Planet> planets;
+StructuredBuffer<BiomConfig> bioms;
+StructuredBuffer<Mountain> mountains;
+
+int chunkWidth;
+int3 chunkPosition;
+float3 seed;
+int numBioms;
+
+static int MIN_PLANET_GAP = 3;
+static int NUM_PLANET_TYPES = 3;
+static int MAX_DIRT_DEPTH = 10;
+static float DIRT_NOISE_FREQUENCY_GROUND = 0.06;
+static float DIRT_NOISE_FREQUENCY_PLANET = 2;
+
+int to1D(int3 id) {
+    return (id.z * chunkWidth * chunkWidth) + (id.y * chunkWidth) + id.x;
+}
+
+float rand(float3 pos)
+{
+    float3 noise = (frac(sin(dot(pos, float3(12.9898, 78.233, 45.6114)*2.0)) * 43758.5453));
+    return abs(noise.x + noise.y + noise.z) * 0.333;
+}
+
+float noise01(float3 pos)
+{
+    return (snoise(pos) + 1) * .5f;
+}
+
+float fNoise(float3 _pos, float3 octaves[3], float3 _seed)
+{
+    float noise = 0;
+    float maxAmplitude = 0;
+        
+    for (int i = 0; i < 3; i++)
+    {
+        float3 pos = _pos * octaves[i].x + seed + _seed;
+        
+        noise += pow(noise01(pos), octaves[i].z) * octaves[i].y;
+        maxAmplitude += octaves[i].y;
+    }
+
+    return noise / maxAmplitude;
+}
+
+float biomNoise(int biomType, float3 worldPos)
+{
+    float3 octaves[3] = {bioms[biomType].octaves.Octave1, bioms[biomType].octaves.Octave2, bioms[biomType].octaves.Octave3};
+    
+    float noise = fNoise(worldPos, octaves, bioms[biomType].seed);
+
+    return noise;
+}
+
+float mountainNoise(Mountain mountain, float3 pos)
+{
+    float3 octaves[3] = {mountain.octaves.Octave1, mountain.octaves.Octave2, mountain.octaves.Octave3};
+    
+    float noise = fNoise(pos, octaves, 0) * 2 - 1;
+
+    return noise * mountain.height;
+}
+
+float2 sphericalCoords(float3 pos)
+{
+    float theta = atan2(sqrt(pos.x * pos.x + pos.y * pos.y), pos.z);  
+    float phi = atan2(pos.y, pos.x);
+
+    return float2(theta, phi); 
+}
+
+float planetNoise(Planet planet, float3 pos, float3 seed)
+{
+    float3 octaves[3] = {planet.octaves.Octave1, planet.octaves.Octave2, planet.octaves.Octave3};
+
+    float2 sCoords = sphericalCoords(pos);
+    
+    float noise = fNoise(float3(sCoords.x, seed.z, sCoords.y), octaves, seed.y) * planet.noiseAmplitude;
+
+    return 1 - noise;
+}
+
+float groundNoise(Planet planet, float3 pos, float seed)
+{
+    float3 octaves[3] = {planet.octaves.Octave1, planet.octaves.Octave2, planet.octaves.Octave3};
+
+    float noise = fNoise(float3(pos.x, seed, pos.z), octaves, 0) * planet.noiseAmplitude;
+
+    return 1 - noise;
+}
+
+bool isInBiom(int biomType, float3 worldPos)
+{
+    return biomNoise(biomType, worldPos) > bioms[biomType].threshold;
+}
+
+float dirtNoisePlanet(float3 pos, float3 seed)
+{
+    float2 sCoords = sphericalCoords(pos);
+
+    return pow(saturate(noise01(float3(sCoords, seed.z) * DIRT_NOISE_FREQUENCY_PLANET)), 0.5) * MAX_DIRT_DEPTH - 4;
+}
+
+float dirtNoiseGround(float3 pos, float3 seed)
+{
+    return pow(saturate(noise01(float3(pos.x, seed.y * 151564.165165, pos.z) * DIRT_NOISE_FREQUENCY_GROUND)), 0.5) * MAX_DIRT_DEPTH - 4;
+}
+
+float randRange(float3 pos, int min, int max)
+{
+    return (int)(min + rand(pos) * (max - min));
+}
+
+int3 randRange3(float3 pos, int min, int max)
+{
+    return int3(
+        randRange(pos + float3(3.6856, 7.387, 95.241), min, max),
+        randRange(pos + float3(123.756, 1.3311, 88.232), min, max),
+        randRange(pos + float3(756.123, 133.71, 232.88), min, max));
+}
+
+void createMountain(int mountainId, int3 id, int3 worldPos, int3 inPlanetPos, int maxHeight, int seed)
+{
+    Mountain mountain = mountains[mountainId];
+    
+    float height = maxHeight * mountainNoise(mountain, float3(worldPos.x, seed, worldPos.z));
+        
+    if(inPlanetPos.y < height)
+    {
+        blocks[to1D(id)].blockType = mountain.blockType;
+    }
+    else
+    {
+        blocks[to1D(id)].blockType = 0;
+    }
+}
+
+void createPlanet(int planetId, int3 id, int3 inGridPos, int3 gridPos, int3 worldPos, float subdivisionSize)
+{
+    
+    float3 seed = float3(gridPos.x + gridPos.y * planetId * 1.321, gridPos.x + gridPos.z * planetId * 11.879, gridPos.x + gridPos.z + gridPos.z * gridPos.x * 32.13); //planet wide seed;
+    Planet planet = planets[planetId];
+    
+    if(rand(gridPos + seed) < planet.rarity)
+    {
+        blocks[to1D(id)].blockType = 0;
+        return;
+    }
+
+    int3 center = subdivisionSize / 2;
+
+    int minR = (int)(subdivisionSize * .5 * planet.sizeRange.x);
+    int maxR = (int)(subdivisionSize * .5 * planet.sizeRange.y);
+
+    int planetSize = randRange(gridPos + seed, minR, maxR);
+    int maxOffset = maxR - planetSize;
+
+    int3 offset = randRange3(gridPos, -maxOffset, maxOffset);           
+
+    int minHeightCutOff = (int)(planetSize * 2 * planet.heightRange.x);
+    int maxHeightCutOff = (int)(planetSize * 2 * planet.heightRange.y);
+    float heightCutOff = randRange(gridPos + seed, minHeightCutOff, maxHeightCutOff);
+    heightCutOff *= groundNoise(planet, ((float3)inGridPos) / subdivisionSize, seed);
+
+    int3 positionRelativeToSphere = inGridPos + offset;
+    float pNoise = planetNoise(planet, positionRelativeToSphere, seed);
+
+    float pointToCenter = distance(positionRelativeToSphere, center);
+    float dirtR = planetSize * pNoise;
+
+    //is in planet
+    if(pointToCenter < dirtR)
+    {
+        float maxHeight = planetSize * 2 - heightCutOff;
+        float yFromBot = inGridPos.y + offset.y - center.y + planetSize;
+
+        float stoneR = dirtR - dirtNoisePlanet(positionRelativeToSphere, seed);
+        float stoneMaxHeight = maxHeight - dirtNoiseGround(positionRelativeToSphere, seed); 
+
+        if(yFromBot < maxHeight)
+        {
+            
+            if( yFromBot < stoneMaxHeight && pointToCenter < stoneR)
+            {            
+                //stone
+                blocks[to1D(id)].blockType = 25;
+                return;
+            }
+
+            //dirt ground
+            blocks[to1D(id)].blockType = planet.blockType;
+            return;
+        }
+
+        
+        //mountains
+        int mountainType = rand(seed) > 0.5 ? planet.mountain0 : planet.mountain1;
+                
+        int3 inPlanetPos = inGridPos + offset - center + int3(0, -planetSize + heightCutOff, 0); // - y == 0 is surface 
+        createMountain(mountainType, id, worldPos, inPlanetPos, heightCutOff, seed);
+        return;
+    }
+    
+    //air
+    blocks[to1D(id)].blockType = 0;   
+}
+
+void createBiom(int3 id, int3 worldPos)
+{
+    BiomConfig biom = bioms[blocks[to1D(id)].biomType];
+    
+    int biomSubdivisionSize = biom.maxPlanetSize;
+
+    int3 gridPos = (int3) (worldPos / biomSubdivisionSize);
+    int3 inGridPos = worldPos - gridPos * biomSubdivisionSize;
+        
+    int planetIndex = (int)(rand(gridPos) * NUM_PLANET_TYPES);
+    int biomPlanets[] = {biom.planet0, biom.planet1, biom.planet2};
+    
+    createPlanet(biomPlanets[planetIndex], id, inGridPos, gridPos, worldPos, biomSubdivisionSize);
+}
+
+void setBiom(int3 id, int3 worldPos)
+{
+    for (int biomType = 0; biomType < numBioms; biomType++)
+    {
+        if(isInBiom(biomType, worldPos))
+        { 
+            if(blocks[to1D(id)].biomType == -1)
+            {
+                blocks[to1D(id)].biomType = biomType;
+                blocks[to1D(id)].blockType = biomType + 1;
+            }
+        }
+    }
+}
+
+[numthreads(8, 8, 8)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    //is overridden
+    if(blocks[to1D(id)].blockType != 0)
+        return;
+    
+    blocks[to1D(id)].position = id;
+    int3 blockPosWorld = id + chunkPosition;
+    blocks[to1D(id)].biomType = -1;
+
+    setBiom(id, blockPosWorld);
+
+    if(blocks[to1D(id)].biomType < 0)
+    {
+        blocks[to1D(id)].blockType = 0;
+        return;
+    }
+
+    // return;
+    createBiom(id, blockPosWorld);
+}

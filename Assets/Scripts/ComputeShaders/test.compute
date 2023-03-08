@@ -1,0 +1,58 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel FindVisibleBlocks
+
+
+struct Block
+{
+    int blockType;
+    int3 position;
+    int visible;
+};
+
+RWStructuredBuffer<Block> blocks;
+int3 dimensions;
+
+
+int to1D(int3 id) {
+    return (id.z * dimensions.x * dimensions.y) + (id.y * dimensions.x) + id.x;
+}
+
+int3 to3D(int idx) {
+    int z = idx / (dimensions.x * dimensions.y);
+    idx -= (z * dimensions.x * dimensions.y);
+    int y = idx / dimensions.x;
+    int x = idx % dimensions.x;
+    return int3(x, y, z);
+}
+
+static int3 faceDirectionsLU[6] = {int3(0, 1, 0), int3(0, -1, 0), int3(0, 0, 1), int3(0, 0, -1), int3(-1, 0, 0), int3(1, 0, 0) }; 
+
+bool hasNeighborFace(int3 blockPos, int face)
+{
+    if (blockPos.x <= 0 || blockPos.x >= dimensions.x - 1 || blockPos.y <= 0 || blockPos.y >= dimensions.y - 1 || blockPos.z <= 0 || blockPos.z >= dimensions.z - 1)
+        return false;
+
+    int3 id = blockPos + faceDirectionsLU[face];
+    return blocks[to1D(id)].blockType != 0;
+}
+
+[numthreads(16, 1, 1)]
+void FindVisibleBlocks (uint3 id : SV_DispatchThreadID)
+{
+    int index = id.x;
+    
+    if(blocks[index].blockType == 0)
+        return;
+    
+    for (int i = 0; i < 6; i++)
+    {
+        int face = i;
+        
+        if (!hasNeighborFace(blocks[index].position, face))
+        {
+            blocks[index].visible = true;
+            break;  
+        }
+    }
+}
+
